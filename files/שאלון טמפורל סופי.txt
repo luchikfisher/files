@@ -1,0 +1,445 @@
+Temporal - תשובות למבחן
+
+1. הגדרה מה זה **TEMPORAL**?
+Temporal היא פלטפורמה שמאפשרת להריץ תהליכים עסקיים ארוכים בצורה עמידה לתקלות. היא מטפלת לבד בדברים כמו retries, שמירת state ו-recovery אחרי כשל, ככה שגם אם worker או שרת או רכיב כשלהו נופלים באמצע – התהליך יכול להמשיך מאותה נקודה, היא עושה replay להיסטוריית האירועים וככה משחזרת את מצב הביצוע.
+⸻
+
+2. הגדרה מה זה Workflow?
+Workflow הוא פונקציה עמידה ובעלת state שמתזמרת תהליך עסקית, והוא פונקציה דטרמיניסטית שמנהלת orchestration של תהליך. הוא קובע איזה שלבים צריכים לקרות ובאיזה סדר, אבל לא מבצע side effects ישירות - הוא מעביר אותם ל-Activities. Temporal שומרת את היסטוריית הביצוע של ה-workflow, ולכן גם אם יש קריסה באמצע אפשר להמשיך מאותה נקודה.
+
+⸻
+
+3. הגדרה מה זה Activity?
+Activity היא פעולה שמבצעת עבודה מול העולם החיצוני, ורצה מחוץ ל-workflow task והיא יכולה להיות non-deterministic. מתאים ל- כתיבה למסד נתונים, קריאת HTTP, שליחת אימייל. בניגוד ל-Workflows, Activities אינם חייבים להיות דטרמיניסטיים. שם קורים כל ה-side effects, ולכן גם עליהן מתבצעים ה-retries כשמשהו נכשל.
+⸻
+
+4. מה הם המרכיבים של הגדרת **ACTIVITY**? תן דוגמאות
+הגדרת Activity מורכבת מ־:
+ הפונקציה עצמה שהיא המימוש בפועל
+ ActivityOptions - ההגדרות שקובעות איך ה Activity תרוץ:
+
+ StartToCloseTimeout - הזמן המקסימלי לניסיון יחיד להסתיים
+ ScheduleToCloseTimeout - סך הזמן הכולל לכל הניסיונות החוזרים
+ ScheduleToStartTimeout - כמה זמן הוא יכול להמתין בתור לפני ש-worker לוקח אותו
+ HeartbeatTimeout - כמה זמן בין heartbeats לפני ש-Temporal מחשיבה אותו כמת
+ RetryPolicy - מספר ניסיונות מקסימלי, מקדם backoff, מרווח בהתחלה, וסוגי שגיאות שלא מבוצע עליהן retry
+
+דוגמה
+
+ActivityOptions options =
+    ActivityOptions.newBuilder()
+        .setStartToCloseTimeout(Duration.ofSeconds(10))
+        .setRetryOptions(
+            RetryOptions.newBuilder()
+                .setMaximumAttempts(3)
+                .setInitialInterval(Duration.ofSeconds(1))
+                .setBackoffCoefficient(2.0)
+                .setDoNotRetry("InvalidInputError")
+                .build())
+        .build();
+
+MyActivities activities =
+    Workflow.newActivityStub(MyActivities.class, options);
+
+activities.myActivity(input);
+
+⸻
+
+5. מה ההבדל בין **STARTTOCLOSE** ו־**SCHEDULETOCLOSE**?
+
+ StartToCloseTimeout הוא ה-timeout של ניסיון ביצוע יחיד - מהרגע ש-worker לוקח את המשימה ועד שהיא חייבת להסתיים. זה ערך שכמעט תמיד מגדירים.
+
+ ScheduleToCloseTimeout הוא סך הזמן הכולל של הפעילות, כולל כל הניסיונות החוזרים וכל הזמן שהפעילות חיכתה בתור. זה הזמן הכולל שיש לפעילות להסתיים, כולל כל ה-retries.
+
+לכן אם יש RetryPolicy עם כמה ניסיונות אבל אתה מגדיר רק StartToCloseTimeout, הניסיונות החוזרים יכולים להמשיך תאורטית לנצח (עד MaximumAttempts). אם יש דרישה אמיתית שהפעילות תסתיים תוך זמן מסוים וזה חייב להסתיים תוך 5 דקות לא משנה מה - אז ScheduleToCloseTimeout זה מה שצריך. לפעמים בכלל לא מגדירים אותו, ואז ה-retries יכולים להימשך הרבה יותר זמן.
+
+⸻
+
+6. מה ההבדל בין signal, query, update? מתי ארצה להשתמש בכל אחד
+
+
+
+
+ Signal: הודעת שגר ושכח אל ה-workflow. משתמשים בזה כשרוצים לשלוח אירוע ל-workflow או לגרום לשינוי state ולא צריכים אישור (למשל: “המשתמש ביטל את ההזמנה”).
+
+ Query: קריאה סינכרונית של מצב ה-workflow הנוכחי. שום דבר לא נכתב ושום דבר לא משתנה. משתמשים כשצריך לבדוק מצב בלי להשפיע עליו (למשל: “באיזה שלב ההזמנה הזו נמצאת?”).
+
+ Update: בקשה סינכרונית שמשנה state ומחזירה תוצאה ונועד לפתור בעיות של Signals. ה-handler יכול לאמת את הקלט ולדחות אותו לפני שהוא נכתב להיסטוריה. משתמשים כאשר צריך התנהגות דומה לקריאה רגילה לפונקציה (RPC) - רוצים אישור שהשינוי באמת קרה (למשל: “הוסף את הפריט הזה להזמנה, ותגיד לי אם זה הצליח”).
+
+ההבדל המרכזי הוא ש-Query לא נוגעים בכלל בהיסטוריה, אבל Update כן. אם חשוב לקבל תשובה שהשינוי בוצע, עדיף להשתמש ב-Update.
+⸻
+
+7. בהכרזה של ה־WORKFLOW מה קורה לוקלית אצל ה- WORKER שאנחנו מרימים אצלנו ומה קורה מרוחק אצל שרת TEMPORAL?
+
+בשרת Temporal (מרחוק):
+
+ ביצוע ה-Workflow נרשם ומקבל WorkflowID / RunID ייחודי
+ כל אירוע (activity scheduled, activity completed, signal received, timer fired…) נוסף להיסטוריית האירועים
+ השרת מנהל את task queues ומחליט מתי לתזמן עבודה
+
+ב-Worker (מקומית):
+
+ ה-worker מבצע polling לתור המשימות
+ כאשר מגיעה משימת workflow, ה-worker מריץ replay על כל היסטוריית האירועים כדי לשחזר את המצב בזיכרון
+ קוד חדש רץ קדימה מהנקודה שבה ה-replay מסתיים
+ פקודות (schedule activity, start timer וכו’) נשלחות חזרה לשרת
+
+קוד ה-workflow רץ על ה-worker, לא על השרת. השרת רק מאחסן אירועים ומפיץ משימות. ה-worker לא צריך לשמור state בעצמו, כי הוא יכול לשחזר אותו מה-event history - וזה בדיוק מה שהופך את האתחולים מחדש לבטוחים.
+
+⸻
+
+8. איך אני יכול להריץ activities ו-workflows במקביל?
+
+
+ניתן להשיג מקביליות על ידי התחלת כמה קריאות ExecuteActivity (או ExecuteChildWorkflow) ואיסוף ה-Future handles שלהן לפני שמחכים על אחת מהן.
+
+דוגמה ב-Java:
+
+Promise<ResultA> futureA =
+    Async.function(activities::activityA, input);
+
+Promise<ResultB> futureB =
+    Async.function(activities::activityB, input);
+
+ResultA resultA = futureA.get();
+ResultB resultB = futureB.get();
+
+שתי הפעילויות נשלחות מיד. אם היית קורא future.get() מיד אחרי כל ExecuteActivity, הן היו רצות בצורה סדרתית. בדרך כלל מפעילים את כולן ואז מחכים לכולן.
+
+למקביליות דינמית (למשל מספר משימות לא ידוע), משתמשים ב-Async.function(...) או Promise.allOf(…) לכל משימה ובתבנית דמוית WaitGroup, או אוספים את כל ה-futures למערך ומבצעים עליהן איטרציה.
+
+⸻
+
+9. מה זה דטרמיניסטי? איזה סוג של קוד ארצה לשים ל־activity ואיזה לשים ב־workflow? תן דוגמאות?
+
+דטרמיניסטי פירושו: בהינתן אותם קלטים ואותה היסטוריה, הקוד תמיד ייצור את אותם אירועים. בכל פעם ש-Temporal מריץ replay ל-workflow, הוא מבצע מחדש את פונקציית ה-workflow ומצפה לאותה סדרת אירועים בדיוק. אם מסלול הקוד מתפצל - ה-replay נשבר ונוצרת שגיאת non-determinism.
+
+דברים שיכולים לשבור דטרמיניזם:
+
+ מספרים אקראיים, UUIDs, Instant.now, System.currentTimeMillis()
+ קריאות HTTP חיצוניות, שאילתות DB
+ Goroutines ללא Async.function(…) או Promise.allOf(...)
+ משתני סביבה שנקראים בזמן ריצה
+ מפות שנעשות עליהן איטרציות בסדר אקראי
+ שינויי קוד שמשנים את רצף האירועים באמצע ביצוע
+
+בדרך כלל:
+
+ Workflow = לוגיקת orchestration נקיה. הסתעפויות, סדר, המתנה. משתמשים רק ב-workflow.Now(), workflow.NewRandom(), ו-APIs של Temporal לשינה וטיימרים.
+
+ Activity = כל השאר. כל פעולה עם העולם החיצוני או משהו לא דטרמיניסטי.
+
+דוגמה:
+
+String id = Workflow.sideEffect(
+        String.class,
+        () -> UUID.randomUUID().toString()
+);
+
+אם צריך משהו בלתי צפוי בתוך workflow, זה נעטף ב-workflow.SideEffect - Temporal שומר את התוצאה בהיסטוריה ככה שה-replay משתמש בערך השמור במקום לחשב מחדש.
+
+⸻
+
+10. מה זה IDEMPOTENCE
+
+
+פעולה היא idempotent אם הרצה שלה מספר פעמים מייצרת את אותה תוצאה כמו הרצה אחת. זה חשוב ב-Temporal כי activities מבוצעות שוב ושוב במקרה של retry. אם activity כותבת רשומה למסד נתונים והיא מתבצעת מחדש אחרי כשל חלקי, אני לא רוצה רשומה כפולה.
+
+בפועל זה אומר: להשתמש ב-upserts במקום inserts, להשתמש במפתחות idempotency בקריאות API חיצוניות, ולוודא שהתוצאה הנצפית של הפעילות אותו דבר ללא קשר למספר הפעמים שהיא רצה. Temporal מבצעת activities לפחות פעם אחת (at-least-once execution) ולכן צריך לוודא שהפעילות idempotent
+
+⸻
+
+11. איך אני מתמודד עם exceptions ב־temporal (מתוך workflow ו-activity)? מה קורה ל־activity שנכשל ול- workflow שנכשל?
+
+
+ב-Activity:
+
+ אם activity זורקת שגיאה, Temporal מנסה אותה מחדש לפי RetryPolicy
+ אם זורקים שגיאה שאינה ניתנת ל-retry (או שהיא ב-NonRetryableErrorTypes), היא נכשלת מיד בלי ניסיונות נוספים לאחר שכל הניסיונות נגמרו, השגיאה חוזרת ל-workflow כ-ActivityError שמכיל את השגיאה המקורית (או Temporal עוטף exceptions ל:ActivityFailure או ApplicationFailure)
+
+ב-Workflow:
+
+ אפשר לתפוס ActivityError מקריאת future.get() ולטפל בו - לבצע retry ידני, לקחת מסלול פיצוי, או להפיץ את השגיאה
+ אם פונקציית ה-workflow עצמה מחזירה שגיאה (לא מטופלת), ביצוע ה-workflow נכשל - הוא לא מבוצע מחדש כברירת מחדל (בשונה מ-activities)
+ Temporal נותנת CanceledError, TimeoutError ו-ApplicationError - צריך להבדיל ביניהם בטיפול בשגיאות,
+Workflow נכשל כאשר פונקציית ה-workflow זורקת exception שלא נתפס. Temporal מסמן אותו: WorkflowExecutionFailed
+ברוב המקרים עדיף שה-workflow יתפוס את השגיאה ויחליט מה לעשות. במקום להיכשל לגמרי. בדרך כלל רוצים ש-workflows יהיו עמידים על ידי תפיסת שגיאות מ-activities והחלטה כיצד להגיב, במקום לתת להן לעלות ולסיים את ה-workflow.
+
+⸻
+
+12. מה זה workflow replay? איך בדיוק זה קורה? מה בדיוק temporal שומר על כל ריצה של  workflow
+
+
+מה Temporal שומר: עבור כל ביצוע workflow, Temporal שומר היסטוריית אירועים - לוג append-only של כל דבר משמעותי שקרה: workflow started, activity scheduled, activity completed (עם תוצאה), timer started, timer fired, signal received וכו’.
+
+איך replay עובד:
+	1.	Worker לוקח משימת workflow
+	2.	הוא מריץ את פונקציית ה-workflow מההתחלה
+	3.	עבור כל ExecuteActivity, Sleep וכו’, הוא בודק בהיסטוריה: “האם זה כבר קרה?”
+	4.	אם כן משתמש בתוצאה השמורה, ולא מבצע מחדש
+	5.	אם לא זו משימה חדשה, והוא באמת שולח אותה לביצוע
+
+פונקציית ה-workflow יכולה לרוץ שוב בכל פעם שמגיעה משימה חדשה, אבל רוב ה”ביצוע” הוא רק fast-forward דרך תוצאות שמורות. רק הקוד החדש בקצה באמת רץ מחדש.
+
+בגלל זה דטרמיניזם מאוד חשוב, אם הקוד לוקח מסלול אחר בזמן replay מאשר בפעם המקורית, הפקודות שהוא מייצר לא יתאימו למה שיש בהיסטוריה, ו-Temporal תזרוק non-determinism panic. זה גם הסיבה שלא ניתן לשנות קוד workflow שנמצא בביצוע בלי להשתמש ב-versioning (workflow.GetVersion).
+
+⸻
+
+13. מה קורה אם worker נפל באמצע ACTIVITY באמצע WORKFLOW? מה קורה כשהוא יעלה מחדש? מה יקרה ל- ACTIVITY/WORKFLOW?
+
+מה קורה:
+
+ ה-activity רצה וה-worker מת
+ ה-StartToCloseTimeout של המשימה פג (או heartbeat timeout אם מוגדר)
+ Temporal מסמן את ה-activity כ-timeout
+ היא מתוזמנת מחדש לתור המשימות ונלקחת על ידי worker אחר (או אותו אחד אחרי restart)
+ הפעילות מתחילה מחדש מהתחלה בניסיון חדש
+
+ה-workflow ממשיך לחכות. מבחינת ה-workflow הפעילות פשוט עדיין לא הסתיימה. ברגע שה-retry מצליח, ה-workflow ממשיך כרגיל. ה-workflow עצמו לעולם לא “אובד” כי המצב שלו נשמר בשרת Temporal, לא ב-worker.
+
+אם הפעילות ביצעה הרבה עבודה לפני הקריסה, היא תעשה אותה שוב ב-retry. לכן עושים heartbeat לפעילויות ארוכות, ולכן idempotence חשוב.
+
+⸻
+
+14. מה קורה כשה TEMPORAL עצמו נופל?
+
+שום דבר לא הולך לאיבוד. Temporal שומרת את היסטוריית האירועים בצורה עמידה במסד הנתונים (בדרך כלל למסד נתונים כמו Cassandra או PostgreSQL) לפני שהיא מאשרת כל פעולה. אם שרת Temporal קורס:
+
+ כל מצב ה-workflow וה-activity נשמר במסד הנתונים
+ משימות activity שהיו בתהליך אבל לא הושלמו יעברו timeout ויתבצע עליהן retry כאשר השרת חוזר
+ workers יתחברו מחדש וימשיכו לבצע polling
+ workflows ממשיכים בדיוק מהמקום שבו נעצרו
+
+זה אחד היתרונות המרכזיים של Temporal - היא לא רק עמידה לקריסות workers, אלא גם לקריסות של עצמה. שכבת ה-persistence היא source of true, לא הזיכרון.
+
+⸻
+
+15. מה קורה PAYLOAD ששולחים ל־WORKFLOW/ACTIVITY? איך זה משפיע על האופן בו נבחר להעביר מידע בהפעלת ACTIVITIES? איזה סוג של מידע היינו שמים בפרמטרים?
+
+כל מה שנשלח אל ומה-workflows וה-activities עובר סריאליזציה (בדרך כלל ל-JSON דרך DataConverter). זה משפיע על הדרך שבה מעבירים נתונים:
+
+ פרמטרים מועתקים עמוק - אין reference משותף בין הקורא והנקרא
+ payloadים גדולים (structs גדולים, blobs של bytes) עוברים סריאליזציה בכל קריאה ונשמרים בהיסטוריה
+ ל-Temporal יש מגבלת payload ברירת מחדל של 2MB
+
+מה זה אומר לגבי העברת נתונים:
+
+לא להעביר blobs גדולים. לא להעביר חיבורי מסד נתונים, file handles, או כל דבר שלא ניתן לסריאליזציה. אם צריך לעבד קובץ גדול, להעביר reference (מפתח S3, מזהה DB) ולתת ל-activity להביא אותו. Activities צריכות לקבל מזהים קלים או value objects קטנים, לא אובייקטים דומייניים שלמים.
+
+לכן כדאי לשים לב איזה נתונים שומרים במצב של ה-workflow - כל פרמטר לכל קריאת activity נכנס להיסטוריה.
+
+⸻
+
+16. מה זה local activity? מתי נרצה להשתמש בזה?
+
+Local activity רצה באותו תהליך worker שבו רץ ה-workflow, בלי לעבור דרך task queue של Temporal. היא לא יוצרת משימת activity נפרדת בשרת.
+
+משתמשים בה כש:
+
+ הפעולה מהירה (פחות משנייה)
+ רוצים להימנע מה-round-trip של תזמון דרך השרת
+ retry מנוהל על ידי ה-workflow task ולא על ידי activity task נפרד בשרת
+ העבודה קלה מספיק ככה שאם ה-worker נאבד, אפשר פשוט לנסות שוב ברמת ה-workflow
+
+לא להשתמש כש:
+
+ הפעילות עלולה לקחת זמן רב
+ צריך heartbeating
+ צריך שהיא תשרוד קריסת worker באופן עצמאי
+
+היתרון הוא ש-local activities מהירות יותר, אבל מה שיהיה איתם קשור ל-worker. activity מרוחקת יכולה להילקח על ידי worker אחר; local activity לא.
+
+⸻
+
+17. מה זה Heartbeat?
+
+Heartbeat הוא אות כל תקופה ש“אני עדיין חי” ש-activity ארוכה שולחת ל-Temporal באמצעות:
+
+Activity.getExecutionContext().heartbeat(details);
+
+אם Temporal לא מקבלת heartbeat בתוך HeartbeatTimeout, היא מסמנת את הפעילות כ-timeout ומבצעת retry.
+
+מעבר ל-liveness, heartbeats גם נושאים פרטי התקדמות. כאשר הפעילות מתבצעת מחדש, הניסיון החדש יכול לקרוא:
+
+ActivityExecutionContext ctx = Activity.getExecutionContext();
+
+if (ctx.getHeartbeatDetails(String.class).isPresent()) {
+    String details = ctx.getHeartbeatDetails(String.class).get();
+}
+
+כדי לקבל את המידע שנשמר ב-heartbeat האחרון. ככה אפשר לממש פעילויות שניתנות להמשך (resumable activities) - אם אני מעבד פריט 4000 מתוך 10000 וה-worker מת, ה-retry יכול להמשיך מ-4000 במקום מ-0. לפעילויות ארוכות זה טוב, בלי זה לפעמים פעילות ארוכה יכולה להתחיל מחדש מההתחלה אחרי קריסה.
+⸻
+
+18. מה זה CHILDWORKFLOW, איך הוא משפיעה על מי שיצר אותו ואיך מי שיצר אותו משפיע עליו?
+
+Child workflow הוא workflow שמופעל על ידי workflow אחר. ההורה משתמש ב-ExecuteChildWorkflow ומקבל future.
+
+איך זה קשורים:
+
+ כברירת מחדל הParent מחכה שה Child יסתיים לפני שה-future של הParent נפתר
+ אם הParent מבוטל או מסתיים, ניתן להגדיר שה Child יבוטל יחד איתו (ParentClosePolicy)
+ ל Child יש event history משלו, WorkflowID משלו, והתנהגות retry משלו
+ הParent יכול לשלוח signal ל Child, להמתין לו, או להפעיל אותו בלי לחכות (detach עם ABANDON close policy)
+
+מתי להשתמש:
+
+ כדי לפצל workflow ארוך מאוד שמתקרב למגבלות גודל ההיסטוריה
+ כדי לייצג תת-תהליך לוגי עצמאי שרוצים לעקוב אחריו בנפרד
+ כדי להריץ כמה תהליכים עסקיים במקביל
+
+ההבדל מפעילות רגילה הוא ש-child workflow הוא workflow מלא, לשמור מצב, לטפל ב-signals ולשרוד את הParent - זה מתאים יותר ל-workflow נוסף מאשר ל-activity אחת.
+
+⸻
+
+19. איך testים עובדים למול TEMPORAL?
+
+Temporal מביאה חבילת testsuite שנותנת סביבת בדיקה ל-workflow - runtime מדומה בזיכרון שרץ סינכרונית בלי צורך בשרת אמיתי.
+
+מה אפשר לעשות:
+
+ לרשום workflows ו-activities בסביבת הבדיקה
+ לבצע mock ל-activities עם OnActivity(…) ולהחזיר תוצאות מבוקרות בלי I/O אמיתי
+ לקדם זמן באופן מלאכותי (לעבור timers בלי לחכות)
+ לוודא ש-activities מסוימות נקראו עם ארגומנטים מסוימים
+ לשלוח signals ו-queries במהלך הבדיקה
+ לבדוק ש-workflows מטפלים נכון בשגיאות מ-activities
+
+TestWorkflowEnvironment testEnv =
+    TestWorkflowEnvironment.newInstance();
+
+Worker worker = testEnv.newWorker("test-task-queue");
+
+worker.registerWorkflowImplementationTypes(MyWorkflowImpl.class);
+worker.registerActivitiesImplementations(new MyActivitiesImpl());
+
+testEnv.start();
+
+MyWorkflow workflow =
+    testEnv.getWorkflowClient()
+        .newWorkflowStub(
+            MyWorkflow.class,
+            WorkflowOptions.newBuilder()
+                .setTaskQueue("test-task-queue")
+                .build());
+
+workflow.run(input);
+
+
+לכן בדרך כלל: בגלל שאפשר לבצע mock ל-activities, בדיקות לוגיקת workflow הן unit tests טהורות - מהירות, דטרמיניסטיות וללא תשתיות. לכן בדיקות של workflows ב-Temporal יחסית נוחות, אבל זה דורש לשמור I/O בתוך activities ו-orchestration בתוך workflows. אם זה מתערבב, זה רק מסבך את הבדיקות.
+
+⸻
+
+20. מה קורה אם אני צריך ליצור הרבה ACTIVITIES בתוך WORKFLOW אחד? איך זה משפיע על כתיבת הממשקים למול temporal?
+
+
+כאשר רושמים activities ל-worker, Temporal דורשת לרשום את הפונקציה בפועל (או מתודות של struct). אם יש workflow גדול שקורא ל-20 activities שונות, רישום של 20 פונקציות נפרדות נהיה מבולגן ועושה coupling.
+
+בדרך כלל פותרים את זה ככה: לקבץ activities קשורים בתוך struct עם מתודות ולרשום את ה-struct. ה-workflow קורא לפעילויות לפי שם המתודה דרך הטיפוס הרשום:
+
+public class OrderActivities {
+
+    public void reserveInventory(...) { }
+
+    public void chargePayment(...) { }
+
+}
+
+מה-workflow משתמשים ב-activity stub - שמצביע לממשק - ככה שקוד ה-workflow לא מייבא ישירות את המימוש של ה-activity. ואז זה שומר על ניתוק בין לוגיקת ה-worker להגדרת ה-workflow וגם מקל את החיים על mocking בבדיקות.
+
+אם workflow אחד מתחיל להכיל הרבה מאוד activities (נגיד עשרות), זה בדרך כלל סימן שאולי לשקול פירוק אחר של המערכת - אולי חלק מהפעילויות צריכות להיות מקובצות, או שחלק מהלוגיקה צריכה להיות child workflow.
+
+⸻
+
+21. איך היית מממש תהליך שמצריך אישור ידני או התערבות אנושית כחלק מה־flow שלו?
+
+
+הדרך המקובלת לעשות את זה היא בעזרת Signal כדי לעצור את ה-workflow עד שאדם מבצע פעולה:
+
+public class OrderWorkflowImpl implements OrderWorkflow {
+
+    private boolean approved = false;
+
+    @Override
+    public void runWorkflow() {
+        Workflow.await(() -> approved);
+
+        if (!approved) {
+            // compensation logic
+        }
+    }
+
+    @Override
+    public void approvalDecision(boolean decision) {
+        this.approved = decision;
+    }
+}
+
+ה-workflow “ישן” (בלי עלות - אין polling ואין thread חסום) עד שה-signal מגיע. המערכת הפונה לאדם (UI, בוט, קישור אימייל) קוראת ל-SignalWorkflow כאשר מתקבלת החלטה.
+
+בדרך כלל משלבים זאת עם workflow.Sleep ו-workflow.Select ככה שאם האדם לא מגיב בתוך N ימים, מבצעים escalation או rejection אוטומטי:
+
+Promise<Void> timer =
+    Workflow.newTimer(Duration.ofHours(48));
+
+Workflow.await(
+    () -> approved || timer.isCompleted()
+);
+
+if (!approved) {
+    // timeout handling
+}
+
+זה אחד מהמקרים של שימוש החזקים ביותר של Temporal - workflow יכול לחכות לאדם ימים או שבועות ללא עלות תשתית, והוא ניתן להמשך באופן מלא.
+
+⸻
+
+22. מתי ארצה לקרוא continue as new?
+
+ContinueAsNew מסיים את ביצוע ה-workflow הנוכחי ומיד מתחיל חדש עם אותו קלט (או קלט אחר), אבל עם event history נקי. מבחוץ נראה כאילו אותו workflow עדיין רץ.
+
+מתי להשתמש:
+
+ כש workflow רץ בלי סוף (לולאה מתמשכת שמעבדת אירועים, עבודה בסגנון cron)
+ כאשר היסטוריית האירועים מתקרבת למגבלות הגודל של Temporal (כאשר ההיסטוריה גדלה מאוד (לעיתים עשרות אלפי אירועים), או payload גדל)
+ כש רוצים להעביר מצב מעודכן לאיטרציה הבאה בצורה נקייה
+
+if (iterationCount > 1000) {
+    Workflow.continueAsNew(updatedInput);
+}
+
+לכן בדרך כלל בלי ContinueAsNew, workflow שרץ חודשים מצטבר עם היסטוריה עצומה. replay נהיה איטי יותר, צריכת הזיכרון גדלה, ובסוף מגיעים למגבלות לא טובות. ContinueAsNew מאפשר להתחיל ריצה חדשה עם היסטוריה נקייה. אם מתכננים workflow ארוך או נצחי, אז צריך לתכנן את זה מראש.
+
+⸻
+
+23. בונוס – מתי מתאים להשתמש ב־TEMPORAL ומתי לא? אילו יתרונות חסרונות)?
+
+להשתמש ב-Temporal כש:
+
+ יש תהליכים ארוכי־טווח שנמשכים דקות, שעות, ימים או יותר
+ צריך orchestration אמין בין מספר שירותים עם retries ופיצוי
+ יש שלבי אישור אנושי או אישור חיצוני בתהליך
+ רוצים מצב עמיד בלי לנהל state machine במסד נתונים בעצמי
+ הוא מאפשר לממש סמנטיקה עסקית הדומה ל-exactly-once באמצעות primitives של at-least-once ו-idempotence התהליך חייב לשרוד כשל תשתית בצורה שקופה
+
+לא להשתמש ב-Temporal כש:
+
+ צריך latency של תת-מילישנייה - יש overhead מובנה של task queue
+ התהליך קצר ופשוט - handler HTTP או כתיבה קצרה ל-DB לא צריכים orchestration
+ הצוות קטן והעלות התפעולית של הרצת Temporal לא מוצדקת…
+ צריך throughput עצום של משימות קטנות - תור הודעות ייעודי (Kafka, SQS) יהיה מהיר יותר
+
+יתרונות:
+
+ עמידות לתקלות כמעט “בחינם”
+ אין צורך ב-state machines ידניים במסדי נתונים
+ בדיקות נוחות (mock ל-activities, זמן מדומה)
+ נראות פצצה (יש לומר ביושר) לכל ביצוע דרך UI והיסטוריה
+ timers, signals והתערבות אנושית מובנים
+
+חסרונות:
+
+ מגבלות דטרמיניזם הם עקומת למידה אמיתית 
+ דיבוג של replay errors וניהול versioning של workflows פעילים לא טריוויאלי
+ גידול ההיסטוריה דורש ניהול כל הזמן (ContinueAsNew)
+ מגבלות גודל payload מחייבות חשיבה זהירה על העברת נתונים
+ עלות תפעולית של הרצת הקלאסטר (נפתר חלקית עם Temporal Cloud)
