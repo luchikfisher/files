@@ -1,0 +1,130 @@
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import scan
+
+ES_URL = "http://localhost:9200"
+
+INDEX_A = "index_a"
+INDEX_B = "index_b"
+
+ROW_ID_FIELD = "row_id"
+IS_AUTOTAG_FIELD = "is_autotag"
+
+IGNORED_FIELDS = {
+    "row_id",
+    "heb_name",
+    "op_id",
+}
+
+
+def get_base_row_id(row_id: str) -> str:
+    return row_id.rsplit("_", 1)[0]
+
+
+def is_valid_single_hit(group):
+    if len(group) != 1:
+        return False
+    return group[0]["row_id"].endswith("_0")
+
+
+def normalize(doc):
+    return {
+        k: v for k, v in doc.items()
+        if k not in IGNORED_FIELDS
+    }
+
+
+def load_index(client, index_name):
+    groups = {}
+
+    for hit in scan(
+        client,
+        index=index_name,
+        query={
+            "query": {
+                "term": {IS_AUTOTAG_FIELD: False}
+            }
+        },
+        size=1000,
+    ):
+        src = hit["_source"]
+        row_id = src.get(ROW_ID_FIELD)
+
+        if not row_id:
+            continue
+
+        base = get_base_row_id(row_id)
+
+        groups.setdefault(base, []).append(src)
+
+    result = {}
+
+    for base, docs in groups.items():
+        if is_valid_single_hit(docs):
+            result[base] = docs[0]
+
+    return result
+
+
+def compare_docs(doc_a, doc_b):
+    a = normalize(doc_a)
+    b = normalize(doc_b)
+
+    keys_a = set(a.keys())
+    keys_b = set(b.keys())
+
+    only_a = keys_a - keys_b
+    only_b = keys_b - keys_a
+
+    diffs = {}
+
+    for k in keys_a & keys_b:
+        if a[k] != b[k]:
+            diffs[k] = (a[k], b[k])
+
+    return {
+        "only_in_a_fields": list(only_a),
+        "only_in_b_fields": list(only_b),
+        "different_values": diffs,
+        "is_equal": not only_a and not only_b and not diffs,
+    }
+
+
+def main():
+    es = Elasticsearch(ES_URL)
+
+    print("Loading A...")
+    data_a = load_index(es, INDEX_A)
+
+    print("Loading B...")
+    data_b = load_index(es, INDEX_B)
+
+    keys_a = set(data_a.keys())
+    keys_b = set(data_b.keys())
+
+    only_a = keys_a - keys_b
+    only_b = keys_b - keys_a
+    shared = keys_a & keys_b
+
+    print("\n--- RESULTS ---\n")
+
+    print(f"Only in A: {len(only_a)}")
+    print(f"Only in B: {len(only_b)}")
+    print(f"Shared: {len(shared)}")
+
+    different = []
+    equal = []
+
+    for k in shared:
+        cmp = compare_docs(data_a[k], data_b[k])
+
+        if cmp["is_equal"]:
+            equal.append(k)
+        else:
+            different.append((k, cmp))
+
+    print(f"Different: {len(different)}")
+    print(f"Equal: {len(equal)}")
+
+
+if __name__ == "__main__":
+    main()
