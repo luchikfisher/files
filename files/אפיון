@@ -1,0 +1,620 @@
+
+
+⸻
+
+אפיון: ניהול גרסאות לבריכות מידע במעבר מ־HDFS ל־Apache Iceberg
+
+1. רקע
+
+כיום כל בריכת מידע נשמרת ב־HDFS לפי שם בריכה ושם גרסה, לדוגמה:
+
+Salary_1_0_1
+Salary_1_0_2
+Users_2_1_1
+Users_2_1_2
+
+המודל הזה נותן שני יתרונות חשובים:
+
+הראשון הוא שמירת גרסאות אחורה בצורה מלאה, לצורך rollback או בדיקות היסטוריות.
+
+השני הוא הפרדה מלאה בין גרסאות, כך ש־reflow לגרסה חדשה לא מתערבב עם מידע ישן, גם כאשר יש שינוי משמעותי בדאטה או במבנה הטבלה.
+
+הבעיה המרכזית היא בצד הצרכן. כדי לקרוא את הבריכה הפעילה, הצרכן צריך לפנות לשירות metadata חיצוני, להבין אילו גרסאות קיימות, לאתר איזו גרסה מסומנת כ־active, ורק אז לקרוא מה־HDFS. זה יוצר coupling מיותר בין הצרכן לבין מנגנון ניהול הגרסאות הפנימי.
+
+במסגרת המעבר ל־Iceberg, המטרה היא להעביר את ניהול הגרסאות למודל טבעי יותר: הצרכן יקרא תמיד שם לוגי קבוע של בריכה, והמערכת תדאג לכך שהשם הזה יצביע תמיד לגרסה הפעילה.
+
+⸻
+
+2. מטרות
+
+הפתרון צריך לאפשר:
+
+צרכן שקורא תמיד שם קבוע, לדוגמה:
+
+SELECT * FROM pools.salary;
+
+בלי להכיר גרסאות, paths או metadata API.
+
+כל reflow יוצר גרסה חדשה מלאה של הבריכה, באופן מבודד מהגרסה הפעילה.
+
+עד שה־reflow לא הסתיים בהצלחה מלאה, הצרכן ממשיך לקרוא את הגרסה הפעילה הקודמת.
+
+פרסום גרסה חדשה הוא פעולה אטומית מבחינת הצרכן: או שרואים את הגרסה הקודמת, או שרואים את החדשה. אין מצב ביניים.
+
+Rollback מחזיר את הבריכה לגרסה פעילה קודמת, בלי לבנות מחדש את הדאטה.
+
+כל גרסאות העבר נשמרות, לפחות בשלב זה, ללא מדיניות מחיקה.
+
+⸻
+
+3. הנחות עבודה
+
+כל בריכה היא עצמאית לחלוטין. אין תלות בין Salary, Users או כל בריכה אחרת.
+
+אין צורך ב־transaction רוחבי בין כמה בריכות.
+
+הצרכן, ברוב המכריע של המקרים, קורא רק את הגרסה הפעילה.
+
+Reflow הוא בנייה מלאה מחדש של הבריכה. גם אם בפועל חלק מהמידע זהה לגרסה הקודמת, מבחינת המערכת זו גרסה חדשה מלאה.
+
+ולידציית schema/data/business rules מתבצעת לפני שלב ה־publish ואינה חלק מהאחריות של מנגנון הקריאה.
+
+Rollback מיידי פירושו החזרת ה־active לגרסה קודמת.
+
+⸻
+
+4. עקרון הפתרון
+
+לכל בריכה יהיה שם לוגי קבוע:
+
+pools.salary
+pools.users
+
+מאחורי הקלעים, כל publish מוצלח יוצר גרסה חדשה שנשמרת בהיסטוריה.
+
+הצרכן לא קורא:
+
+Salary_1_0_2
+
+אלא תמיד:
+
+pools.salary
+
+תהליך reflow נראה כך:
+
+מצב התחלתי:
+salary active = v3
+בזמן reflow:
+salary active = v3
+salary candidate = v4
+אחרי הצלחה:
+salary active = v4
+salary v3 retained for rollback
+במקרה rollback:
+salary active = v3
+salary v4 retained for investigation / future decision
+
+הדגש המרכזי: אין merge בין גרסאות. אין append לגרסה קיימת. אין overwrite חלקי. Reflow מייצר candidate מלא, ורק לאחר מכן מתבצע publish.
+
+⸻
+
+5. איך זה מתבטא בפועל ב־Iceberg
+
+ב־Iceberg, טבלה אינה רק אוסף קבצים. היא מנוהלת באמצעות metadata שמצביע על snapshots. Snapshot מייצג מצב שלם של הטבלה בזמן מסוים, כולל סט קבצי הדאטה ששייכים לאותו מצב. כלומר, snapshot הוא לא “דלתא” בלבד, אלא נקודת מבט מלאה על מצב הטבלה באותו רגע.  
+
+בנוסף, Iceberg עובד במודל של commits למטא־דאטה. שינוי בטבלה יוצר metadata חדש, וה־catalog מחליף את ההפניה למצב החדש. זו הנקודה שמאפשרת לצרכן לראות מצב עקבי של הטבלה ולא מצב חצי־כתוב.  
+
+Iceberg תומך גם ב־branches ו־tags. Branch הוא reference משתנה ל־snapshot, ו־tag הוא reference קבוע יותר ל־snapshot היסטורי. זה מתאים לשני צרכים שונים: branch ל־candidate בזמן עבודה, ו־tag לסימון גרסאות שפורסמו או נקודות rollback.  
+
+מימוש אפשרי:
+
+pools.salary                -- הטבלה הלוגית שהצרכן קורא
+main                        -- הגרסה הפעילה
+branch/reflow_2026_06_28    -- candidate בזמן reflow
+tag/salary_v1_0_2            -- גרסה שפורסמה ונשמרת ל־rollback
+tag/salary_last_good         -- נקודת rollback נוחה
+
+ב־Spark מול Iceberg קיימת תמיכה בכתיבה ל־branch וב־Write-Audit-Publish, כלומר כתיבה למקום מבודד, בדיקה, ואז פרסום. זה מתאים עקרונית למודל שבו Flink/Temporal בונים candidate ורק לאחר מכן מפרסמים אותו.  
+
+עם זאת, חשוב: אסור לבסס את האפיון רק על המילה “branch”. צריך לוודא במימוש הספציפי שלכם — catalog, engine, Spark/Flink versions והרשאות — שהפעולה שמפרסמת candidate ל־main אכן מתבצעת בצורה אטומית ומתאימה ל־full replacement.
+
+⸻
+
+6. שתי דרכי מימוש מעשיות ב־Iceberg
+
+חלופה A: טבלת staging ואז REPLACE TABLE
+
+במודל הזה, לכל reflow נוצרת טבלת candidate נפרדת:
+
+pools.salary
+pools.salary__candidate__run_12345
+
+ה־reflow כותב את כל התוצאה החדשה ל־candidate.
+
+לאחר הצלחה מלאה של Temporal, Flink והוולידציה, מבצעים replace אטומי לטבלה הלוגית:
+
+REPLACE TABLE pools.salary
+USING iceberg
+AS SELECT * FROM pools.salary__candidate__run_12345;
+
+ב־Iceberg דרך Spark, REPLACE TABLE ... AS SELECT יוצר snapshot חדש עם תוצאת ה־SELECT ושומר את היסטוריית הטבלה. התיעוד מתאר זאת כ־atomic table replacement.  
+
+יתרונות:
+
+מאוד ברור לצוותים.
+
+קל לבדוק את ה־candidate לפני publish.
+
+קל למחוק candidate שנכשל.
+
+מתאים מאוד ל־full build.
+
+פחות מסוכן מבחינה תפיסתית: אין “ערבוב” עם הטבלה הפעילה.
+
+חסרונות:
+
+דורש storage כפול זמנית בזמן reflow.
+
+צריך לנהל ניקוי של טבלאות candidate שנכשלו או התיישנו.
+
+צריך לוודא שה־REPLACE שומר את מה שצריך בהיסטוריה, tags ו־properties בהתאם למדיניות שלכם.
+
+זו החלופה שהייתי בוחר כ־baseline אם הצוות רוצה פתרון ברור ובטוח לרבעון הקרוב.
+
+⸻
+
+חלופה B: Branch / WAP על אותה טבלה
+
+במודל הזה, לא יוצרים טבלת candidate נפרדת, אלא עובדים עם branch של אותה טבלת Iceberg.
+
+pools.salary@main
+pools.salary@reflow_run_12345
+
+ה־reflow כותב ל־branch זמני. הצרכן ממשיך לקרוא מ־main. אחרי הצלחה מלאה, מקדמים את main ל־snapshot של ה־branch או מפרסמים את ה־snapshot המאושר.
+
+יתרונות:
+
+מנצל בצורה טבעית את יכולות Iceberg.
+
+פחות ישויות פיזיות לניהול.
+
+מתאים עקרונית למודל Write-Audit-Publish.
+
+מאפשר תיעוד גרסאות דרך snapshots/tags בצורה נקייה.
+
+חסרונות:
+
+דורש בשלות גבוהה יותר של הצוות ב־Iceberg.
+
+דורש לוודא תמיכה מלאה של Spark/Flink/catalog שלכם בכתיבה, קריאה ו־publish מול branches.
+
+עלול להיות פחות אינטואיטיבי לצוותים שלא מכירים Iceberg branches.
+
+אם המימוש לא מוגדר היטב, יש סיכון לבלבול בין write ל־branch לבין publish ל־main.
+
+זו חלופה טובה, אבל הייתי מכניס אותה רק אחרי POC טכני שמוכיח את כל נקודות ה־lifecycle.
+
+⸻
+
+חלופה C: טבלאות פיזיות לגרסאות + View קבוע
+
+במודל הזה ממשיכים לייצר טבלה נפרדת לכל גרסה:
+
+pools.salary_v1_0_1
+pools.salary_v1_0_2
+
+ומחזיקים view:
+
+CREATE OR REPLACE VIEW pools.salary AS
+SELECT * FROM pools.salary_v1_0_2;
+
+יתרונות:
+
+דומה מאוד למה שקיים היום.
+
+קל להבין rollback: מחליפים את ה־view לגרסה קודמת.
+
+אין תלות עמוקה ב־Iceberg branches.
+
+חסרונות:
+
+ממשיך לשמר חלק מהמורכבות הישנה.
+
+היסטוריית הגרסאות מנוהלת מחוץ למודל הטבעי של Iceberg.
+
+צריך לוודא שה־view replacement אטומי ואחיד בכל מנועי הקריאה.
+
+פחות נקי לטווח ארוך.
+
+זו חלופת ביניים בלבד. לא הייתי בוחר בה כיעד ארכיטקטוני.
+
+⸻
+
+חלופה D: עדכון ישיר של הטבלה הפעילה
+
+במודל הזה ה־reflow כותב ישירות ל־pools.salary באמצעות append, merge או overwrite.
+
+יתרונות:
+
+פשוט לכאורה.
+
+אין candidate חיצוני.
+
+חסרונות:
+
+לא מתאים לדרישה שלכם.
+
+מגדיל סיכון לשאריות מידע ישן.
+
+מגדיל סיכון לחשיפת מצב לא רצוי.
+
+קשה יותר ל־rollback נקי.
+
+Iceberg תומך בפעולות overwrite אטומיות, אבל התיעוד מציין שהתוצאה של INSERT OVERWRITE תלויה ב־partition overwrite mode וב־partitioning של הטבלה. לכן זה לא בסיס טוב ל־reflow מלא שבו רוצים ודאות שאין שאריות לא רצויות.  
+
+חלופה זו לא מומלצת.
+
+⸻
+
+7. המלצה
+
+ההמלצה היא לאמץ את חלופה A כשלב ראשון:
+
+Logical Iceberg Table + Full Candidate Table + Atomic Replace + Tags
+
+כלומר:
+
+הצרכן קורא תמיד:
+
+pools.salary
+
+כל reflow יוצר:
+
+pools.salary__candidate__<run_id>
+
+לאחר הצלחה מלאה, המערכת מבצעת publish אטומי שמחליף את מצב pools.salary לגרסה החדשה.
+
+לפני publish יש לסמן את הגרסה הפעילה הנוכחית כ־tag, לדוגמה:
+
+salary_v1_0_2
+salary_last_good
+
+לאחר publish יש לסמן גם את הגרסה החדשה כ־tag, לדוגמה:
+
+salary_v1_0_3
+
+בשלב מאוחר יותר, אחרי שהצוות צובר ניסיון עם Iceberg, ניתן לבחון מעבר לחלופה B — עבודה עם branches/WAP בלבד.
+
+⸻
+
+8. Lifecycle מוצע
+
+8.1 התחלת Reflow
+
+Temporal פותח run חדש:
+
+pool_name = salary
+run_id = 12345
+status = RUNNING
+candidate_table = pools.salary__candidate__12345
+current_active_snapshot = <snapshot_id>
+
+8.2 בניית Candidate
+
+Flink כותב את תוצאת ה־reflow המלאה ל־candidate table.
+
+הכתיבה אינה נוגעת ב־pools.salary.
+
+לקוחות ממשיכים לקרוא מהטבלה הפעילה הקיימת.
+
+8.3 ולידציה
+
+מתבצעות בדיקות מחוץ למנגנון זה:
+
+סכמה.
+
+ספירות.
+
+טווחי תאריכים.
+
+איכות נתונים.
+
+בדיקות עסקיות.
+
+בדיקות completeness.
+
+רק אם כל הבדיקות עברו, עוברים ל־publish.
+
+8.4 Publish
+
+שלב publish צריך להיות פעולה מבוקרת אחת:
+
+1. tag current active as previous / last_good
+2. replace logical table with candidate result
+3. tag new active version
+4. update metadata DB status to PUBLISHED
+
+אם publish נכשל, אין לשנות את הסטטוס ל־PUBLISHED. המערכת צריכה להשאיר את ה־active הקיים בתוקף.
+
+8.5 Rollback
+
+Rollback מבוצע על ידי החזרת הטבלה ל־snapshot/tag קודם.
+
+salary active = salary_v1_0_2
+
+אין בנייה מחדש של קבצים.
+
+אין מחיקה מיידית של הגרסה החדשה.
+
+ה־metadata DB מתעד:
+
+status = ROLLED_BACK
+rolled_back_from = v1_0_3
+rolled_back_to = v1_0_2
+
+⸻
+
+9. תפקיד SQL Server / Metadata API לאחר המעבר
+
+ה־metadata API לא צריך לשמש את הלקוח כדי לגלות איזו גרסה לקרוא.
+
+במקום זה, הוא נשאר כלי ניהולי פנימי.
+
+הוא ישמור:
+
+pool_name
+run_id
+candidate_table / branch_name
+version_name
+iceberg_snapshot_id
+status
+started_at
+finished_at
+published_at
+published_by
+rollback_from
+rollback_to
+validation_status
+temporal_workflow_id
+
+הצרכן לא צריך לקרוא ממנו בזמן query רגיל.
+
+כלומר, SQL Server עובר מתפקיד של “runtime resolver ללקוח” לתפקיד של control plane ניהולי.
+
+⸻
+
+10. מדדי ביצוע
+
+אלו מדדים טכניים שכדאי למדוד בכל reflow ובכל publish.
+
+Reflow Duration
+
+כמה זמן עבר מתחילת ה־Temporal workflow ועד candidate מוכן.
+
+reflow_duration_seconds
+
+Publish Duration
+
+כמה זמן לוקח מרגע שהוולידציה הסתיימה ועד שהגרסה החדשה פעילה.
+
+publish_duration_seconds
+
+יעד: publish צריך להיות קצר משמעותית מה־reflow. הוא לא אמור להיות שלב עיבוד כבד.
+
+Consumer Switch Visibility
+
+כמה זמן עובר מרגע publish ועד שהצרכן רואה את הגרסה החדשה.
+
+consumer_visibility_lag_seconds
+
+יעד: נמוך מאוד, תלוי catalog/cache/engine.
+
+Rollback Duration
+
+כמה זמן לוקח להחזיר active לגרסה קודמת.
+
+rollback_duration_seconds
+
+יעד: דקות בודדות או פחות, כתלות באישור תפעולי.
+
+Failed Reflow Isolation
+
+מספר מקרים שבהם reflow נכשל אבל השפיע על הטבלה הפעילה.
+
+active_table_impact_on_failed_reflow
+
+יעד: 0.
+
+Query Performance Regression
+
+השוואת ביצועי קריאה לפני ואחרי publish:
+
+p50_query_duration
+p95_query_duration
+p99_query_duration
+
+לפי בריכה ולפי query pattern מרכזי.
+
+Metadata Growth
+
+מעקב אחר גידול metadata של Iceberg:
+
+snapshot_count
+metadata_file_count
+manifest_count
+table_metadata_size
+
+Iceberg ממליץ לבצע תחזוקה כמו expiring snapshots כדי למחוק קבצים שכבר אינם נדרשים ולשמור על metadata קטן יחסית, אך במקרה שלכם יש להתאים זאת למדיניות שמירת הגרסאות ולא למחוק snapshots/tags שדרושים ל־rollback.  
+
+Storage Growth
+
+מעקב אחר נפח כולל:
+
+active_version_size
+historical_versions_size
+candidate_tables_size
+orphan_files_size
+
+כרגע המדיניות היא לשמור הכל, אבל עדיין צריך למדוד את העלות.
+
+⸻
+
+11. מדדי הצלחה
+
+הפרויקט ייחשב מוצלח אם מתקיימים התנאים הבאים:
+
+הצרכן קורא בריכה לפי שם לוגי בלבד, ללא קריאה מוקדמת ל־metadata API.
+
+SELECT * FROM pools.salary;
+
+Reflow שנכשל אינו משפיע על הגרסה הפעילה.
+
+Publish מוצלח מחליף את הגרסה הפעילה בלי מצב ביניים גלוי לצרכן.
+
+Rollback לגרסה קודמת אפשרי ללא בנייה מחדש של הנתונים.
+
+כל גרסה שפורסמה ניתנת לזיהוי לפי snapshot/tag/version record.
+
+אין ערבוב בין נתונים מגרסה קודמת לגרסה חדשה.
+
+זמן publish קצר וצפוי.
+
+המערכת שומרת audit trail מלא: מי פרסם, מתי, מאיזה run, לאיזה snapshot, ואיזו גרסה הייתה לפני כן.
+
+⸻
+
+12. סיכונים ופעולות מניעה
+
+סיכון: שימוש שגוי ב־append / merge / overwrite
+
+אם מפתח יכתוב ישירות לטבלה הפעילה, עלול להיווצר ערבוב מידע.
+
+מניעה:
+
+לא לאפשר כתיבה ישירה ל־main כחלק מ־reflow.
+
+להגדיר הרשאות נפרדות ל־candidate ול־active.
+
+להכניס בדיקת CI / code review על פעולות כתיבה.
+
+סיכון: candidate לא באמת מייצג גרסה מלאה
+
+אם Flink מייצר תוצאה חלקית, publish יפרסם מידע חסר.
+
+מניעה:
+
+ולידציות completeness לפני publish.
+
+ספירות מול מקור.
+
+בדיקות partition/date coverage.
+
+בדיקת expected keys.
+
+סיכון: מחיקת snapshots היסטוריים
+
+אם תחזוקת Iceberg תמחק snapshots שנדרשים ל־rollback, תאבד יכולת שחזור.
+
+מניעה:
+
+כל גרסה שפורסמה תקבל tag.
+
+מדיניות expiration לא תמחק snapshots שמוחזקים על ידי tags.
+
+בדיקה תקופתית שכל version record ב־SQL Server עדיין מצביע ל־snapshot קיים.
+
+סיכון: חוסר תאימות בין Spark, Flink, Trino ו־Catalog
+
+לא כל סביבת Iceberg תומכת באותה רמה ב־branches, tags, WAP או procedures.
+
+מניעה:
+
+POC טכני ממוקד לפני התחייבות.
+
+בדיקה מול המנועים בפועל: Spark, Flink, Trino וה־catalog שלכם.
+
+לא להכניס branch-based publishing לפני שהוכח end-to-end.
+
+סיכון: Cache בצד צרכן
+
+ייתכן ש־Spark/Trino/catalog cache יגרום לצרכן לראות metadata ישן לזמן קצר.
+
+מניעה:
+
+להגדיר מדידת visibility lag.
+
+לתעד התנהגות cache.
+
+להגדיר refresh policy אם נדרש.
+
+⸻
+
+13. החלטה מוצעת לרבעון הקרוב
+
+ליישם את המודל הבא:
+
+One logical Iceberg table per pool
+Full candidate table per reflow
+Atomic publish using Iceberg table replacement
+Tags for published versions and rollback points
+SQL Server as control plane only
+
+לא ליישם בשלב ראשון:
+
+Direct writes to active table
+Partial overwrite
+Append-based reflow
+Client-side version resolution
+Cross-pool transactions
+
+לבחון בנפרד, לאחר POC:
+
+Iceberg branches / WAP as a replacement for candidate tables
+
+⸻
+
+14. POC נדרש לפני סגירת מימוש
+
+לפני שמתחייבים סופית לאפיון הרבעוני, צריך להריץ POC קצר וממוקד על בריכה אחת.
+
+ה־POC צריך להוכיח:
+
+יצירת candidate מלא.
+
+קריאה רציפה של הצרכן מהגרסה הפעילה בזמן שה־candidate נבנה.
+
+Publish אטומי לגרסה חדשה.
+
+Rollback לגרסה קודמת.
+
+שמירת גרסאות היסטוריות.
+
+קריאה מ־Spark.
+
+קריאה מ־Trino, אם רלוונטי.
+
+התנהגות במקרה כשל באמצע reflow.
+
+התנהגות במקרה כשל בזמן publish.
+
+מדידת publish duration ו־consumer visibility lag.
+
+זה לא POC כללי של Iceberg. זה POC של lifecycle.
+
+⸻
+
+15. סיכום
+
+המעבר ל־Iceberg צריך לשנות את מודל העבודה כך שהלקוח לא ינהל גרסאות בעצמו.
+
+הלקוח קורא תמיד שם לוגי קבוע של בריכה.
+
+המערכת בונה גרסה חדשה כמועמד מבודד.
+
+רק לאחר הצלחה מלאה מתבצע publish אטומי.
+
+Rollback הוא החזרת active לגרסה קודמת.
+
+היסטוריית גרסאות נשמרת באמצעות snapshots/tags ו־metadata ניהולי.
+
+ההמלצה לרבעון הקרוב היא להתחיל במימוש שמרני וברור: candidate table מלאה לכל reflow, publish אטומי לטבלה הלוגית, tags לגרסאות שפורסמו, ו־SQL Server כ־control plane בלבד. זה נותן את רוב היתרונות של Iceberg בלי להכניס מוקדם מדי מורכבות של branching production flow.
