@@ -1,0 +1,106 @@
+כן. יש כמה אלטרנטיבות אמיתיות ל־DB, ולא כולן “פחות טובות”. הבחירה תלויה בעיקר בשאלה האם הסכמות הן configuration מבצעי דינמי, artifact גרסאי, או קוד/קונפיגורציה שצריכה לעבור review.
+
+האלטרנטיבות המרכזיות:
+
+1. MongoDB / DB כמקור אמת
+
+זו האופציה שדיברנו עליה.
+
+מתאים במיוחד אם אתה צריך state עשיר: draft, compiled, validated, published, failed, archived, active pointer, audit, הרשאות, מי יצר, מי פרסם, rollback וכו’.
+
+יתרונות: נוח מאוד לניהול סטייט; קל לעשות versioning; מתאים ל־UI שמייצר ומעדכן; קל לחבר למטא־דאטה מוצרי שכבר קיימת; מאפשר publish אטומי יחסית; טוב ל־runtime lookup.
+
+חסרונות: פחות “GitOps”; קשה יותר לבצע code review טבעי; צריך לבנות מנגנוני audit/rollback טובים; אם ה־JSON עצום יש מגבלת document במונגו; צריך לחשוב על backup ושחזור.
+
+זו בעיניי האופציה הכי מתאימה אם זה פיצ׳ר מוצרי/מבצעי חי.
+
+2. Git repository כמקור אמת
+
+כל סכמה נשמרת כקובץ JSON בריפו, למשל:
+
+schemas/
+  product-a/
+    table-view/
+      v17.json
+      v18.json
+
+ה־UI או השירות שלך פותחים Pull Request, CI מריץ validation, ואחרי merge/deploy הסכמה זמינה.
+
+יתרונות: audit מעולה; review טבעי; rollback ברור; מתאים לארגונים עם GitOps; קל לראות diff; פחות “קסם” בדאטהבייס.
+
+חסרונות: איטי ומסורבל יותר; פחות מתאים למשתמשים לא טכניים; קשה יותר לנהל draft/editing דרך UI; publication תלוי CI/CD; פחות מתאים אם צריך שינוי מהיר בפרודקשן.
+
+מתאים אם כל שינוי סכמה חייב לעבור review הנדסי.
+
+3. Object Storage, למשל S3/MinIO, עם metadata מינימלי
+
+ה־JSON עצמו נשמר כקובץ, למשל:
+
+s3://schemas/product-a/table-view/v17.json
+
+ובצד יש metadata כלשהו, אפילו DB קטן או manifest.
+
+יתרונות: טוב לקבצים גדולים; זול; פשוט; מתאים לגרסאות immutable; אין מגבלת 16MB כמו document יחיד במונגו; קל לשרת ולשמור הרבה גרסאות.
+
+חסרונות: לא טוב לבד לניהול state; צריך עדיין לדעת מה active; קשה לעשות queries; צריך מנגנון publication/locking/audit במקום אחר.
+
+בעיניי זו אופציה טובה אם ה־payloadים גדולים מאוד. לרוב הייתי משלב: metadata ב־DB, payload ב־Object Storage.
+
+4. Config service / Schema Registry פנימי
+
+בונים שירות ייעודי שהוא מקור האמת. מאחוריו יכול להיות DB, Git או Object Storage, אבל שאר המערכת לא יודעת ולא אכפת לה.
+
+ה־API קורא:
+
+GET /schema-runtime/products/{productId}/table/active
+
+והניהול נעשה דרך:
+
+POST /schema-management/...
+
+יתרונות: abstraction נקי; קל להחליף storage בעתיד; מרכז validation, publish, rollback ו־cache; טוב ארכיטקטונית.
+
+חסרונות: עוד שירות לתחזק; דורש יותר אפיון; לא פותר לבד את שאלת האחסון אלא עוטף אותה.
+
+זו כנראה הבחירה הארכיטקטונית הכי נכונה: לבנות Schema Registry, ובשלב ראשון לשמור מאחוריו במונגו.
+
+5. קבצים על mount / shared volume
+
+כלומר להמשיך יחסית קרוב למה שקיים היום: הסכמות הן קבצים בתיקיות, והרכיב קורא מה־filesystem.
+
+יתרונות: פשוט; קרוב למצב הקיים; נוח אם התשתית כבר עובדת; קל להבין.
+
+חסרונות: קשה מאוד לנהל concurrency, versioning, active pointer, audit, permissions, rollback נקי, validation ו־publication. בנוסף, shared filesystem בפרודקשן יכול להיות מקור לצרות.
+
+לדעתי זו אופציה פחות טובה לפיצ׳ר החדש, אלא אם רוצים POC מהיר מאוד.
+
+6. שמירה בתוך Docker image / artifact
+
+כלומר הסכמות נארזות כחלק מהאימג׳.
+
+יתרונות: immutable; כל release כולל בדיוק את הסכמות שאיתן הוא נבדק; rollback דרך deployment; טוב ל־compliance מסוים.
+
+חסרונות: כל שינוי סכמה דורש build/deploy; לא מתאים לעריכה דינמית; publication איטי; מערבב קוד עם קונפיגורציה עסקית משתנה.
+
+לדעתי זו הכי פחות מתאימה למה שאתה מתאר.
+
+ההמלצה שלי:
+
+אם הסכמות הן חלק ממוצר חי, עם UI שמייצר אותן, גרסאות, publish ו־rollback — לך על:
+
+Schema Registry + MongoDB
+
+כלומר Mongo שומר:
+
+builderPayload
+runtimePayload
+version
+status
+active pointer
+audit
+
+וה־API החיצוני שלך לא “יודע Mongo”, אלא מדבר עם שירות/מודול Schema Registry.
+
+אם בעתיד ה־JSONים יהיו כבדים מאוד, תעביר רק את ה־payload ל־Object Storage ותשאיר את המטא־דאטה במונגו.
+
+אם הארגון דורש review הנדסי חזק לכל שינוי, אז Git-backed flow הוא אלטרנטיבה רצינית. אבל אם המטרה היא כלי תפעולי נוח, DB/Registry עדיף.
