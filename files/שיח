@@ -1,0 +1,442 @@
+כן. הנה סיכום מלא ומסודר של כל מה שדיברנו עד עכשיו, מההקשר הרחב ועד להחלטות הארכיטקטוניות, הבעיות, האלטרנטיבות והנקודות שצריך לבדוק באפיון.
+
+אנחנו מדברים על מצב שבו קיים אצלך רכיב API שהוא המקור המרכזי שמתקשר עם רכיב ה־UI. הרכיב הזה שולף נתונים מאלסטיק לפי שאילתה, ומחזיר אותם להצגה. לצד הנתונים עצמם, קיימות סכמות JSON שמגדירות כיצד ה־UI צריך להציג חלקים מסוימים, בעיקר טבלה: עמודות, צורת הצגה, פרטים עיצוביים/לוגיים, כנראה מיפויים לשדות, פורמטים ועוד. הסכמות הללו מחולקות היום לפי מוצרים, בתיקיות, עם הרבה גרסאות לאורך זמן, כאשר הקוד יודע לבחור את הגרסה הנכונה. כיום הסכמות נוצרות ידנית, וזה הפך לכאב משמעותי כי מדובר בקובצי JSON שיכולים להגיע לאלפי שורות.
+
+הרצון החדש הוא לאפשר בנייה נוחה של הסכמות דרך UI ייעודי. אבל לאחר המיקוד שלך, הבהרנו שהאפיון שלך לא מתחיל בשאלה איך נראה ה־UI ואיך המשתמש בונה בו את הטבלה. מבחינתך, השלב הזה כבר הסתיים: יש JSON “מבושל”, מוכן, אחרי כל מה שצריך מה־UI. מכאן מתחילה האחריות שלך: איך מקבלים את ה־JSON, איך שומרים אותו, איך נותנים לו גרסה, איך מוודאים שהוא תקין, איך מפרסמים אותו, איך מונעים התנגשויות, איך מחזירים אותו בזמן runtime, ואיך מחברים אותו למנגנון הקיים של הצגת הנתונים.
+
+הנקודה המרכזית שעלתה היא שלא נכון לחשוב על זה בתור “UI שמייצר JSON”, אלא בתור מערכת ניהול סכמות: Schema Management / Schema Registry / Schema Management & Runtime Delivery. כלומר מערכת שמנהלת סכמות כתוצר מבצעי גרסאי: עם draft, validation, compile, publish, active version, rollback, audit, cache ו־runtime delivery.
+
+בתחילת הדרך הצעתי לא למהר להישאר במודל שבו הסכמות נשמרות בתוך image או mount ומתעדכנות דרך CI/CD. הסיבה היא שסכמה כזו, במיוחד אם היא נוצרת דרך UI ומשתנה מבצעית, דומה יותר ל־configuration דינמי או metadata גרסאי מאשר לקוד אפליקטיבי רגיל. אם כל שינוי דורש build/deploy, זה מסורבל, איטי, פחות נוח, ויוצר תלות מיותרת בין שינויי תצוגה לבין מחזור החיים של האפליקציה.
+
+מתוך זה הגענו למחשבה ש־DB יכול להיות מתאים מאוד, במיוחד כי כבר יש לך DB מוצלח שמנהל הרבה metadata ודאטה על המוצרים שלך. זה חשוב, כי הסכמות לא עומדות לבד; הן קשורות למוצר, לסוג התצוגה, לגרסה, לסביבה, לסטטוס פרסום, אולי ל־tenant, אולי לגרסת נתונים, ואולי למיפוי באלסטיק. לכן טבעי לחבר אותן למודל מוצרי שכבר קיים.
+
+אחת הדאגות החשובות שהעלית היא מצב שבו שתי סכמות חדשות נוצרות כמעט במקביל. אם הכל קבצים בתיקייה או משהו שמנוהל חיצונית בצורה פחות טרנזקציונית, נשאלת השאלה מי נותן את מספר הגרסה, איך יודעים מה לפני מה, מה נחשב הגרסה הפעילה, ומה קורה אם שתי פעולות publish מתרחשות סמוך זו לזו. כאן DB נותן יתרון ברור: אפשר לנהל state, versioning ו־active pointer בצורה אטומית יותר, עם constraints, transactions או locking.
+
+הגענו לעיקרון חשוב: ה־UI לא צריך לקבוע את מספר הגרסה הסופי. ה־UI שולח payload, אולי עם baseVersion, אבל ה־Backend שלך הוא זה שמחליט מה version הבא. כלומר המשתמש או צוות ה־UI לא שולחים “זו גרסה 17”. הם שולחים “זו סכמה חדשה למוצר X מסוג TABLE_VIEW, שנבנתה על בסיס גרסה 16”. השירות שלך, בתוך transaction, בודק מה הגרסה האחרונה, נותן version חדש, שומר, ומחזיר ל־UI את מספר הגרסה שנוצר.
+
+דיברנו על מבנה ישויות אפשרי. ברמה פשוטה, יכולה להיות ישות כמו:
+
+product_ui_schema_versions
+
+שבה יש:
+
+id
+productId
+schemaType
+version
+status
+baseVersion
+builderPayload או runtimePayload
+checksum
+createdBy
+createdAt
+compiledAt
+validatedAt
+publishedBy
+publishedAt
+environment אם מחליטים לשים אותו שם
+ועוד metadata רלוונטי.
+
+אבל המלצתי לא לסמוך רק על isActive בתוך מסמך הגרסה, ולא להניח שהגרסה הכי גבוהה היא הגרסה הפעילה. זה מסוכן. יכולה להיות גרסה 18 שנוצרה אבל לא פורסמה, גרסה 17 שהיא הפעילה, גרסה 19 שנכשלה בוולידציה, וגרסה 16 שכבר archived. לכן הצעתי לחשוב על collection/טבלה נפרדת של publications או active pointers.
+
+למשל:
+
+schema_publications
+
+או:
+
+product_ui_schema_active_versions
+
+שבהם יש:
+
+productId
+schemaType
+environment
+activeSchemaVersionId
+activeVersion
+publishedBy
+publishedAt
+
+כך פעולת publish לא “מניחה” שהגרסה האחרונה היא הפעילה, אלא מעדכנת pointer ברור. rollback יכול פשוט לעדכן את ה־active pointer לגרסה ישנה שכבר קיימת ותקינה.
+
+דיברנו גם על state. לא מספיק מצב בינארי “פעיל/לא פעיל”. כדאי לחשוב על מצבים כגון:
+
+DRAFT
+COMPILED
+VALIDATED
+PUBLISHED
+FAILED_VALIDATION
+ARCHIVED
+
+ייתכן שלא כל state יידרש ב־POC, אבל לפחות צריך להפריד בין create לבין publish. עצם זה ש־JSON נקלט ונשמר לא אומר שהוא נהיה הסכמה הפעילה בפרודקשן. זה עיקרון קריטי.
+
+ה־flow הבסיסי שהתגבש הוא:
+
+ה־Schema Builder UI מייצר JSON ביניים או JSON מוכן כלשהו.
+
+הוא שולח אותו לשירות שלך דרך API.
+
+השירות שלך נותן גרסה בצורה אטומית.
+
+השירות שומר את ה־payload ואת ה־metadata.
+
+השירות מריץ validation.
+
+אם צריך, השירות מריץ compile/generation לסכמה סופית.
+
+הגרסה נשמרת כ־draft/validated.
+
+בפעולה נפרדת מישהו מפרסם אותה ל־environment מסוים.
+
+ה־runtime API יודע להחזיר את הסכמה הפעילה לפי product/schemaType/environment.
+
+ה־UI המבצעי משתמש בסכמה הפעילה כדי להציג את הטבלה.
+
+דיברנו על API routes אפשריים. למשל בצד הניהול:
+
+POST /api/schema-management/products/{productId}/schemas/{schemaType}/versions
+
+לקליטת סכמה חדשה.
+
+ה־body יכול לכלול:
+
+baseVersion
+builderPayload או payload
+comment
+אולי פרטי context נוספים.
+
+התשובה מחזירה:
+
+schemaVersionId
+version
+status
+
+אחר כך אפשר route לוולידציה:
+
+POST /api/schema-management/products/{productId}/schemas/{schemaType}/versions/{version}/validate
+
+ואפשר route לפרסום:
+
+POST /api/schema-management/products/{productId}/schemas/{schemaType}/versions/{version}/publish
+
+עם body שכולל למשל:
+
+environment
+comment
+
+וכן routes לקריאה:
+
+GET /api/schema-management/products/{productId}/schemas/{schemaType}/versions
+
+להיסטוריית גרסאות.
+
+GET /api/schema-management/products/{productId}/schemas/{schemaType}/versions/{version}
+
+לגרסה מסוימת.
+
+ובצד runtime:
+
+GET /api/schema-runtime/products/{productId}/schemas/{schemaType}/active?environment=prod
+
+שמחזיר את הסכמה הפעילה.
+
+המלצתי להפריד בין Management API לבין Runtime API. ה־Management API אחראי על כתיבה, יצירה, פרסום, rollback, validation, audit והרשאות חזקות. ה־Runtime API הוא read-only, מהיר, cacheable, פשוט, ומחזיר רק את מה שהמערכת המבצעית צריכה כדי לרנדר.
+
+דיברנו גם על איך הסכמה מגיעה ל־UI המבצעי. היו שתי גישות:
+
+גישה אחת: route אחד שמחזיר גם data מאלסטיק וגם schema.
+
+למשל:
+
+GET /api/products/{productId}/table-view?query=...
+
+והתשובה כוללת:
+
+schemaVersion
+schema
+data
+
+היתרון: ה־UI מקבל הכל ממקום אחד. החיסרון: אם הסכמה גדולה, מחזירים אותה שוב ושוב בכל בקשת data.
+
+גישה שנייה: הפרדה בין schema לבין data.
+
+ה־UI קורא פעם אחת:
+
+GET /api/schema-runtime/products/{productId}/schemas/table/active
+
+ואז קורא נתונים:
+
+GET /api/products/{productId}/search?...
+
+היתרון: יותר נקי, יותר cache-friendly, פחות payload, ויותר נכון אם הסכמה משתנה פחות מהנתונים. החיסרון: ה־UI צריך לנהל שתי קריאות או שה־API צריך לעשות orchestration.
+
+ההמלצה הייתה להעדיף הפרדה, או hybrid שבו יש endpoint config ו־endpoint data נפרדים:
+
+GET /api/products/{productId}/table-view/config
+
+מחזיר schema ו־metadata.
+
+POST /api/products/{productId}/table-view/search
+
+מחזיר data בלבד.
+
+דיברנו על cache. מכיוון שסכמות יכולות להיות גדולות יחסית, לא כדאי לשלוף אותן כל פעם מחדש מה־DB או להחזיר אותן בכל בקשה. כדאי לחשוב על:
+
+cache בזיכרון של ה־API לפי key כמו:
+
+productId:schemaType:environment
+
+שימוש ב־ETag.
+
+שימוש ב־If-None-Match.
+
+החזרת 304 Not Modified אם הסכמה לא השתנתה.
+
+שמירת schemaVersion, etag, lastModified.
+
+ב־publish צריך לעשות cache invalidation, אחרת עלול להיווצר מצב שבו פורסמה גרסה חדשה אבל חלק מהשרתים עדיין מגישים גרסה ישנה.
+
+בהקשר של concurrency דיברנו על כמה בעיות:
+
+שני משתמשים יוצרים גרסה חדשה כמעט במקביל.
+
+שני משתמשים עורכים על בסיס אותה גרסה.
+
+שני publish קורים כמעט יחד.
+
+publish קורה בזמן שה־runtime קורא.
+
+שרת אחד קיבל cache חדש ואחר עדיין מחזיק ישן.
+
+ליצירת version אפשר להשתמש ב־DB transaction, ב־unique constraint על productId + schemaType + version, או בטבלת/collection counter לפי product/schemaType. ב־Mongo אפשר להשתמש ב־atomic update עם increment, או במסמך counter ייעודי. הרעיון הוא שה־version לא מחושב בצד ה־UI ולא בצורה לא אטומית.
+
+לשני משתמשים שעורכים מאותה גרסה הצעתי להשתמש ב־baseVersion. אם משתמש א׳ התחיל מ־16 ופרסם 17, ומשתמש ב׳ התחיל גם מ־16 ומנסה לפרסם גרסה אחרת, המערכת צריכה לזהות שה־baseVersion שלו כבר לא הגרסה הפעילה. אפשר להחליט אם לחסום, להתריע, או לדרוש rebase/review. המלצה זהירה: לאפשר יצירה, אבל בפרסום ל־prod להתריע או לחסום אם baseVersion != currentActiveVersion.
+
+אחר כך שאלת האם MongoDB מתאים כמקום שמירה. אמרתי שכן, MongoDB יכול להתאים מאוד, במיוחד אם כבר יש בו רכיב משמעותי מהמוצרים שלך. הסיבה היא שהסכמה היא בעצם JSON document גדול, גרסאי, עם metadata ו־state. זה מודל טבעי למסמך.
+
+הצגתי מבנה document אפשרי:
+
+_id
+productId
+schemaType
+version
+status
+environment
+baseVersion
+payload
+checksum
+createdBy
+createdAt
+publishedBy
+publishedAt
+
+אבל הדגשתי שלא כדאי לשמור את כל הגרסאות כמערך מוטמע בתוך מסמך המוצר עצמו. כלומר לא לעשות:
+
+product.schemas[...]
+
+בתוך document אחד של product, כי זה יגדל, יהיה פחות נוח לניהול, ויכול לסבך versioning ו־queries. עדיף collection נפרד כגון:
+
+product_ui_schema_versions
+
+ועוד collection ל־active publication:
+
+product_ui_schema_publications
+
+או משהו דומה.
+
+שאלת על מגבלת MongoDB. הסברתי של־MongoDB יש מגבלת document בודד של 16MB. זו לא מגבלה של collection או database, אלא של כל document יחיד. כלומר אפשר שיהיו הרבה documents בגודל 1MB, 5MB או 12MB, אבל document אחד לא יכול לעבור 16MB.
+
+הסברתי גם שמספר שורות ב־JSON לא בהכרח אומר שהוא גדול מאוד. JSON של אלפי שורות יכול להיות מאות KB או כמה MB, ולא בהכרח קרוב ל־16MB. צריך לבדוק בפועל את גודל הקבצים עם ls -lh או wc -c. אם בעתיד כן מגיעים למעל 16MB, יש כמה פתרונות: לפצל את הסכמה לכמה documents, להשתמש ב־GridFS, או לשמור את ה־JSON עצמו ב־Object Storage ולשמור ב־Mongo רק metadata ו־URI.
+
+אחר כך שאלת שאלה חשובה: האם צוות ה־Full Stack שבונה את הממשק לסכמה צריך ליצור את ה־JSON הסופי, או להביא JSON יותר raw/ביניים ואתה תבנה ממנו את הסכמה הסופית. אמרתי שבמקרה שלך, לפי התיאור, עדיף שלא הם ייצרו ישירות את ה־JSON הסופי אם הוא מורכב, ארוך, רגיש לגרסאות ומשמש runtime מבצעי.
+
+המלצתי על הפרדה בין:
+
+Builder Draft Schema או Intent JSON — מה שה־UI מייצר, שמתאר את כוונת המשתמש.
+
+לבין:
+
+Runtime Schema — הסכמה הסופית, הרשמית, שהמערכת המבצעית צורכת.
+
+כלומר צוות ה־Full Stack אחראי על מה המשתמש הגדיר: עמודות, סדר, label, formatter, filters, actions וכו’. השירות שלך אחראי על הפיכת זה לסכמה רשמית: הוספת defaults, יצירת IDs, enrichment, בדיקה מול constraints של המוצר, בדיקת תאימות, schemaFormatVersion, מיפוי לשדות, הרשאות, fallback behavior, metadata ו־compatibility.
+
+הסיבה המרכזית היא ownership. הסכמה הסופית היא חוזה מבצעי. אם צוות ה־UI מייצר אותה ישירות, אז הלוגיקה הקריטית של runtime, backward compatibility, defaults, validation ו־format migrations עוברת לצוות שבונה את המסך. זה יוצר coupling מסוכן. לעומת זאת, אם הם שולחים JSON ביניים, השירות שלך נשאר בעל האחריות על החוזה המבצעי.
+
+הצדדים לשתי הגישות היו כאלה:
+
+אם צוות ה־Full Stack מייצר JSON סופי:
+
+יתרונות: פחות שכבת תרגום, פשוט יותר למימוש מהיר, מה שנוצר ב־UI הוא מה שנשמר, פחות עבודה אצלך.
+
+חסרונות: ה־UI Builder הופך למקור אמת מבצעי; כל שינוי בפורמט הסופי דורש שינוי UI; קשה יותר לשלוט ב־defaults, compatibility, הרשאות, מיפויים, validations ושדות legacy; סיכון גבוה יותר לשבור runtime.
+
+אם צוות ה־Full Stack מייצר JSON ביניים:
+
+יתרונות: הפרדת אחריות בריאה; השירות שלך שומר שליטה על הסכמה הסופית; קל יותר לשנות runtime בלי לשבור UI; קל יותר להוסיף defaults ו־validation; מאפשר migration ו־compatibility; מתאים יותר למערכת מבצעית.
+
+חסרונות: צריך לבנות compiler/generator; צריך לתחזק שני חוזים — פורמט ביניים ופורמט סופי; צריך בדיקות; יש עוד שכבה ארכיטקטונית.
+
+המדדים להכרעה היו:
+
+אם הסכמה הסופית כוללת לוגיקה, defaults, enrichment, הרשאות, field mapping או compatibility — עדיף JSON ביניים.
+
+אם הסכמה הסופית היא פשוט “מה שהמשתמש הגדיר וזהו” — אפשר לשקול JSON סופי.
+
+אם צפויים שינויים עתידיים בפורמט הסכמה — עדיף JSON ביניים.
+
+אם יש כמה צרכנים לאותה סכמה — עדיף שתייצר את הסכמה הסופית אצלך.
+
+אם צוות ה־Full Stack לא מכיר לעומק את הדומיין המבצעי — לא לתת לו לייצר final.
+
+אם חשוב validation רציני לפני publish — עדיף שה־generation וה־validation יהיו אצלך.
+
+ל־POC אפשר להתחיל יותר פשוט, אבל לא כדאי ליצור חוב טכני שבו ה־UI מייצר final בלי בקרה.
+
+אחר כך שאלת האם צוות ה־Full Stack צריך לשמור את JSON הביניים ל־DB ואז אתה תקרא אותו, תעבד אותו ל־JSON סופי ותשמור שוב ל־DB. אמרתי שלא הייתי עושה flow של “הם שומרים DB → אתה קורא → מעבד → שומר DB” כשתי מערכות נפרדות, אלא אם יש סיבה ארגונית חזקה. זה יוצר ownership לא ברור, race conditions, polling או coupling מוזר בין מערכות.
+
+ההמלצה הייתה: ה־UI שולח אליך את JSON הביניים דרך API. השירות שלך שומר גם את JSON הביניים וגם את JSON הסופי תחת אותה גרסה או תחת ישויות קשורות. כלומר flow אחד:
+
+POST /schema-drafts או POST /schema-management/.../versions
+
+ה־body כולל:
+
+productId
+schemaType
+baseVersion
+builderPayload
+
+השירות שלך:
+
+מקבל את builder JSON.
+
+נותן draft id / version.
+
+שומר את ה־builderPayload.
+
+מריץ compile.
+
+מייצר runtimePayload.
+
+שומר גם אותו.
+
+מסמן status כמו COMPILED, VALIDATED או FAILED.
+
+הסיבה לשמור גם ביניים וגם סופי:
+
+ה־builderPayload הוא המקור לעריכה חוזרת. אם המשתמש רוצה לפתוח שוב את הסכמה ב־Builder, עדיף להחזיר לו את המבנה שהוא יצר, לא לנסות לפרק את הסכמה הסופית בחזרה.
+
+ה־runtimePayload הוא המקור לריצה מבצעית. ה־runtime לא צריך לקמפל בכל קריאה ולא צריך להכיר את פורמט הביניים.
+
+אם שומרים רק סופי, קשה לערוך מחדש בצורה נוחה.
+
+אם שומרים רק ביניים, צריך לקמפל כל פעם או בזמן runtime, וזה פחות בטוח ופחות יעיל.
+
+אם שומרים את שניהם, יש audit, debug, rollback ויכולת עריכה טובה.
+
+אמרתי שאפשר לשמור אותם באותו document, למשל:
+
+builderPayload
+runtimePayload
+version
+status
+baseVersion
+createdBy
+createdAt
+compiledAt
+publishedAt
+
+או להפריד לשני collections:
+
+schema_drafts
+
+ו־
+
+schema_versions
+
+אבל לשלב ראשון, אם אין סיבה חזקה להפריד, שמירה באותו document או תחת אותה גרסה היא פשוטה וברורה יותר.
+
+החריג היחיד שהזכרתי: אם ה־Builder עצמו הוא מוצר עצמאי עם lifecycle משלו — autosave, collaborative editing, undo/redo, drafts רבים לפני submit — אז ייתכן שצוות ה־Full Stack כן ישמור drafts פנימיים אצלו. אבל גם אז, נקודת הפרסום אליך צריכה להיות API ברור: “Submit for compilation/publish”. כלומר בזמן עריכה הם יכולים לשמור state פנימי, אבל בזמן שליחה רשמית הם שולחים payload אחד אל השירות שלך.
+
+אחר כך שאלת על אלטרנטיבות אמיתיות לשמירה ב־DB. דיברנו על כמה:
+
+האלטרנטיבה הראשונה היא DB/Mongo כמקור אמת. זו האופציה שבה הסכמות נשמרות כ־documents גרסאיים, עם metadata, status, active pointer, audit ו־publication. היתרונות: נוח לניהול state, מתאים ל־UI דינמי, קל לחבר למטא־דאטה מוצרי קיים, מאפשר publish אטומי יחסית, טוב ל־runtime lookup. החסרונות: פחות GitOps, צריך לבנות audit/rollback טובים, יש מגבלת document אם משתמשים במונגו, וצריך backup/restore.
+
+האלטרנטיבה השנייה היא Git repository כמקור אמת. כל סכמה נשמרת כקובץ JSON בריפו, במבנה תיקיות לפי מוצר וסוג סכמה. ה־UI או השירות פותחים Pull Request, CI מריץ validation, ואחרי merge/deploy הסכמה זמינה. היתרונות: audit מעולה, review טבעי, diff ברור, rollback ברור, מתאים לארגונים עם GitOps. החסרונות: איטי, מסורבל יותר, פחות מתאים למשתמשים לא טכניים, קשה יותר לנהל drafts ו־publish דינמי, תלוי CI/CD. זו אלטרנטיבה רצינית אם כל שינוי סכמה חייב review הנדסי.
+
+האלטרנטיבה השלישית היא Object Storage כמו S3/MinIO/GCS. ה־JSON נשמר כקובץ, למשל path לפי מוצר/סוג/גרסה, וב־DB או manifest שומרים metadata ו־active pointer. היתרונות: טוב לקבצים גדולים, זול, מתאים לגרסאות immutable, אין מגבלת 16MB של document יחיד. החסרונות: Object Storage לבד לא טוב לניהול state, queries, locking ו־audit; צריך עדיין DB או שירות ניהול מסביב. המלצה אפשרית: metadata ב־Mongo, payload ב־Object Storage אם ה־payloadים גדולים.
+
+האלטרנטיבה הרביעית היא Config Service / Schema Registry פנימי. זה בעצם abstraction: כל המערכות מדברות עם שירות סכמות, ולא יודעות אם מאחוריו יש Mongo, Git, S3 או משהו אחר. היתרון: הפרדה נקייה, קל להחליף storage בעתיד, מרכז validation/publish/rollback/cache במקום אחד. החיסרון: עוד שירות או מודול לתחזק, דורש אפיון טוב, ולא פותר לבד את שאלת האחסון אלא עוטף אותה. זו הייתה ההמלצה הארכיטקטונית: לבנות Schema Registry, ובשלב ראשון לשמור מאחוריו במונגו.
+
+האלטרנטיבה החמישית היא קבצים על mount/shared volume. זה קרוב למה שקיים היום. היתרונות: פשוט, מוכר, קל להבין. החסרונות: קשה לנהל concurrency, versioning, active pointer, audit, rollback, validation, permissions ו־publication. shared filesystem בפרודקשן יכול להיות בעייתי. מתאים אולי ל־POC קצר, אבל פחות לפיצ׳ר המלא.
+
+האלטרנטיבה השישית היא שמירה בתוך Docker image או artifact. היתרונות: immutable, כל release כולל בדיוק את הסכמות שנבדקו איתו, rollback דרך deployment. החסרונות: כל שינוי סכמה דורש build/deploy, לא מתאים לעריכה דינמית, מערבב קוד עם קונפיגורציה עסקית משתנה. במקרה שלך זו נראית האופציה הכי פחות מתאימה.
+
+ההמלצה הסופית באלטרנטיבות הייתה:
+
+אם הסכמות הן חלק ממוצר חי, עם UI שמייצר אותן, גרסאות, publish ו־rollback — ללכת על Schema Registry + MongoDB. Mongo שומר builderPayload, runtimePayload, version, status, active pointer, audit. ה־API החיצוני לא “יודע Mongo”, אלא מדבר עם מודול או שירות Schema Registry. אם בעתיד JSONים יהיו כבדים מאוד, אפשר להעביר את payload ל־Object Storage ולהשאיר metadata במונגו. אם הארגון דורש review הנדסי כבד לכל שינוי — Git-backed flow הוא אלטרנטיבה רצינית, אבל פחות מתאים לכלי תפעולי נוח.
+
+בסוף שאלת אילו עוד דאגות לא דיברנו עליהן, ופרטנו רשימת נושאים שצריך לחשוב עליהם באפיון.
+
+הראשונה: חוזה תאימות בין הסכמה לבין ה־UI שרץ בפרודקשן. גם אם JSON תקין, הוא יכול לכלול יכולת שה־UI הנוכחי לא יודע לרנדר. לכן צריך schemaFormatVersion, ואולי גם capabilities. למשל אם הסכמה משתמשת ב־renderer חדש אבל ה־UI בפרוד עוד לא תומך בו, אסור לפרסם אותה.
+
+השנייה: validation מול הנתונים האמיתיים באלסטיק. לא מספיק לבדוק שה־JSON תקין תחבירית. צריך לבדוק field paths, טיפוסים, sortable/filterable, formatter מתאים, מיפוי לשדות קיימים, ושאין הפניות לשדות לא קיימים.
+
+השלישית: rollback אמיתי. לא רק “אפשר לפרסם גרסה ישנה”, אלא לוודא שה־active pointer מתעדכן, cache מתנקה, ה־runtime מפסיק להגיש את הגרסה החדשה, ושאין מצב שבו חלק מהשרתים מגישים v17 וחלק v18 לאורך זמן בלתי סביר.
+
+הרביעית: הרשאות ואחריות. מי רשאי ליצור draft? מי רשאי לפרסם ל־prod? האם צריך approval? האם איש מוצר יכול לפרסם לבד? האם יש הבדל בין staging ל־prod? האם יש separation of duties?
+
+החמישית: audit וחקירה בדיעבד. ביום שבו משהו נשבר בפרוד, צריך לדעת מי יצר, מי פרסם, מתי, מה השתנה, מה היה ה־diff, על בסיס איזו גרסה, ומה הייתה הגרסה הפעילה לפני כן.
+
+השישית: concurrency. שני עורכים, שני publish, יצירת version במקביל, publish בזמן קריאת runtime, cache לא אחיד בין שרתים. צריך locking או optimistic concurrency.
+
+השביעית: גודל וביצועים. אם הסכמה גדולה, לא להחזיר אותה בכל קריאת data. להפריד schema מ־data, להשתמש ב־cache, ETag, compression ואולי preloading.
+
+השמינית: אבטחת תוכן הסכמה. אם הסכמה כוללת renderers, actions, links, expressions או HTML-like content, צריך למנוע XSS, URLs לא מורשים, expression injection, או כל דבר שיכול לגרום להתנהגות לא צפויה ב־UI.
+
+התשיעית: schema migrations. בעתיד פורמט הסכמה עצמו ישתנה. צריך לדעת אם עושים migration לגרסאות ישנות, תומכים בכמה schemaFormatVersions במקביל, או כותבים compatibility layer.
+
+העשירית: בדיקות אוטומטיות לפני publish. לפחות JSON schema validation, business validation, בדיקה מול sample Elastic documents, render smoke test, והשוואה לגרסה קודמת.
+
+האחת עשרה: סביבות. אותה גרסה יכולה להיות פעילה ב־staging ולא ב־prod. לכן publication צריך להיות לפי environment, לא רק status כללי.
+
+השתים עשרה: observability. צריך לוגים ומטריקות: איזו גרסת סכמה נטענה, כמה זמן לקח לטעון, כמה cache hits/misses, כמה validation failures, כמה rollbacks, ומה גרם לשגיאות runtime.
+
+השלוש עשרה: fallback. מה קורה אם אין סכמה פעילה? מה קורה אם הסכמה הפעילה פגומה? האם חוזרים לגרסה אחרונה תקינה? האם מציגים default schema? האם מחזירים שגיאה מבוקרת? זה חייב להיות מוגדר מראש.
+
+אם מחברים הכל להמלצה אחת, אז ההמלצה הכוללת היא:
+
+לא להתייחס לפיצ׳ר כאל שמירת קובץ JSON שנוצר ב־UI, אלא כאל מערכת ניהול סכמות מבצעית.
+
+ה־UI Builder, מבחינתך, לא צריך להיות מרכז הכובד של האפיון. הוא מייצר JSON ביניים או payload מוסכם.
+
+השירות שלך מקבל את ה־payload דרך API.
+
+השירות שלך הוא מקור האמת לגרסאות, סטטוס, שמירה, compile, validation, publish, rollback ו־runtime serving.
+
+השמירה המומלצת לשלב ראשון: MongoDB, אם הוא כבר חלק מרכזי ממודל המוצרים. לשמור ב־collection נפרד של schema versions ולא בתוך מסמך המוצר עצמו.
+
+לשמור גם builderPayload וגם runtimePayload.
+
+לא לתת ל־UI לקבוע version.
+
+לא להניח שהגרסה הכי גבוהה היא הפעילה.
+
+להחזיק active pointer נפרד לפי product/schemaType/environment.
+
+להפריד create מ־publish.
+
+להפריד management API מ־runtime API.
+
+להשתמש ב־cache/ETag.
+
+להגדיר validations קשיחים.
+
+להוסיף audit ו־rollback מהיום הראשון.
+
+להשאיר אפשרות עתידית להעביר payloadים גדולים ל־Object Storage אם Mongo נהיה לא מתאים.
+
+המשפט האפיוני המרכזי שיכול להוביל את המסמך:
+
+“הפיצ׳ר ינהל את מחזור החיים של סכמות תצוגה מוצריות, החל מקליטת payload מה־Schema Builder, דרך יצירת גרסה אטומית, ולידציה, קומפילציה לסכמת runtime, שמירה, פרסום מבוקר לפי סביבה, חשיפה מהירה בזמן ריצה, audit ויכולת rollback. המערכת תפריד בין פורמט העריכה לבין פורמט הריצה, ותשמור את מצב הפרסום והגרסאות כמקור אמת מנוהל ולא כקבצים ידניים בתוך תהליך deployment.”
+
+זה בעצם כל הדיון עד עכשיו, מסודר כבסיס לאפיון.
